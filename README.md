@@ -1,6 +1,6 @@
 # Modaic Probes 
 <p align="center">
-  <img src="./assets/modaic_probes_white.png" alt="Modaic Probes" width="50%" />
+    <img width="50%" alt="Untitled Design 1024x1024" src="https://github.com/user-attachments/assets/80595603-e6b9-4786-a589-bfb1c3373f5e"/>
 </p>
 
 This repository contains a guide for working with Modaic's Open Source confidence estimation probes. Currently, the only supported model is `Qwen/Qwen3.5-4B`.
@@ -13,3 +13,4 @@ There's two types of inference you will need to run to make use of the full judg
 
 <!-- ## Fine-tuning
 You can fine-tune a probe to improve it's confidence estimation abilities for a specific classification task. Follow the [Fine-tuning Guide](./probes2/fine-tuning/fine-tuning.md) to get started. -->
+  <!-- <img src="./assets/modaic_probes_white.png" alt="Modaic Probes" width="50%" /> -->
