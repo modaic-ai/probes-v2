@@ -1,0 +1,16 @@
+lm:
+  model: hosted_vllm/Qwen/Qwen3.5-4B
+  api_base: https://modaic-ai--test-vllm-inference-serve-dev.modal.run/v1
+instructions: Classify the email as spam or not spam
+inputs:
+  - name: subject
+    type: string
+  - name: body
+    type: string
+
+outputs:
+  - name: is_spam
+    type: string
+    options:
+      - spam
+      - not spam

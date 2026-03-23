@@ -1,0 +1,16 @@
+lm:
+  model: ollama/qwen3.5:4b
+  api_base: http://localhost:11434
+instructions: Classify the email as spam or not spam
+inputs:
+  - name: subject
+    type: string
+  - name: body
+    type: string
+
+outputs:
+  - name: is_spam
+    type: string
+    options:
+      - spam
+      - not spam
