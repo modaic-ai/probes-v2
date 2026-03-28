@@ -1,0 +1,4 @@
+council:
+  - openai/gpt-5
+  - anthropic/opus-4.6
+  - vertexai/gemini-3-pro

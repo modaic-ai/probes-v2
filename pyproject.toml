@@ -7,6 +7,7 @@ requires-python = ">=3.11"
 dependencies = [
     "modaic>=0.25.2",
     "datasets",
+    "duckdb",
     "transformers>=5",
     "peft",
     "accelerate",
@@ -21,6 +22,7 @@ cu128 = ["torch", "torchvision"]
 [project.scripts]
 predict = "probes2.inference.predict:main"
 reflect = "probes2.inference.reflect:main"
+tune = "probes2.finetuning.tune:main"
 
 [build-system]
 requires = ["hatchling"]
@@ -40,7 +42,7 @@ url = "https://download.pytorch.org/whl/cu128"
 explicit = true
 
 [tool.uv.sources]
-modaic = { git = "https://github.com/modaic-ai/modaic.git", rev = "db994e2a693cd34f7265df2eb35be49b1bd28ea0", subdirectory = "src/modaic-sdk" }
+modaic = { path = "../modaic/src/modaic-sdk", editable = true }
 torch = [
     { index = "pytorch-cpu", extra = "cpu" },
     { index = "pytorch-cu128", extra = "cu128" },

@@ -40,6 +40,7 @@ If you omit `--device`, it will be auto-detected (CUDA > MPS > CPU).
 | `--input` | Yes | — | Path to input dataset (`.jsonl`, `.parquet`, `.csv`, `.arrow`). Must contain a `messages` column from the `predict` step. |
 | `--output` | Yes | — | Path to output dataset (same format options) |
 | `--model` | Yes | — | HuggingFace model ID (e.g. `modaic/Qwen3.5-4B-probe`) or path to a local PEFT checkpoint |
+| `--checkpoint` | No | — | Path to a tuned linear head `.pt` checkpoint from `tune`. If omitted, the probe's built-in head is used. |
 | `--device` | No | auto | Compute device: `cuda`, `mps`, or `cpu`. Auto-detected if omitted. |
 | `--n-gpus` | No | 1 | Number of GPUs for data-parallel inference. Only works with `--device cuda`. |
 | `--batch-size` | No | 8 | Number of rows per batch. Increase if you have plenty of GPU memory, decrease if you run into OOM errors. |
@@ -67,3 +68,13 @@ uv run reflect --input results.parquet --output results_with_embeddings.parquet 
 ```
 
 This adds an `embeddings` column containing the embedding vector for each row.
+
+## Using A Tuned Head
+
+If you fine-tuned a linear head with the `tune` CLI, you can load it during probe inference:
+
+```bash
+uv run reflect --input results.jsonl --output results_with_confidence.jsonl --model modaic/Qwen3.5-4B-probe --checkpoint tuned_head.pt --device cuda
+```
+
+When `--checkpoint` is provided, `reflect` still uses the base probe model to produce embeddings, but it computes the final confidence score with the tuned linear head from the checkpoint.

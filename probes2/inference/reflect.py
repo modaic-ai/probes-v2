@@ -21,6 +21,7 @@ import torch
 from datasets import Dataset
 from torch.utils.data import DataLoader
 
+from probes2.finetuning.linear_head import build_linear_head_from_checkpoint
 import probes2.registry  # noqa: F401 — registers probe architectures
 
 from probes2.inference.predict import load_input_dataset, save_output_dataset
@@ -39,6 +40,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--output", required=True, help="Path to output dataset")
     parser.add_argument(
         "--model", required=True, help="HuggingFace model ID or local PEFT checkpoint path"
+    )
+    parser.add_argument(
+        "--checkpoint",
+        default=None,
+        help="Optional tuned linear head checkpoint (.pt) produced by the tune CLI",
     )
     parser.add_argument(
         "--device",
@@ -76,6 +82,10 @@ def validate_args(args: argparse.Namespace) -> None:
             "Running on CPU — inference will be very slow. "
             "Consider using --device cuda or --device mps if available.",
             stacklevel=2,
+        )
+    if args.checkpoint is not None and Path(args.checkpoint).suffix.lower() != ".pt":
+        raise ValueError(
+            f"--checkpoint must point to a .pt file, got '{args.checkpoint}'"
         )
 
 
@@ -217,12 +227,33 @@ def calibrate_confidences(
     return torch.sigmoid((margin / temperature) + bias)
 
 
+def extract_last_token_embeddings(
+    hidden_states: torch.Tensor,
+    attention_mask: torch.Tensor,
+) -> torch.Tensor:
+    if hidden_states.ndim != 3:
+        raise ValueError(
+            "Expected hidden states with shape [batch, seq, hidden], "
+            f"got {tuple(hidden_states.shape)}"
+        )
+    if attention_mask.ndim != 2:
+        raise ValueError(
+            f"Expected attention mask with shape [batch, seq], got {tuple(attention_mask.shape)}"
+        )
+    last_positions = attention_mask.sum(dim=1) - 1
+    if torch.any(last_positions < 0):
+        raise ValueError("Cannot extract embeddings from an empty attention mask")
+    batch_indices = torch.arange(hidden_states.size(0), device=hidden_states.device)
+    return hidden_states[batch_indices, last_positions]
+
+
 def run_inference(
     model: Any,
     tokenizer: Any,
     dataset: Dataset,
     batch_size: int,
     with_embeddings: bool,
+    linear_head: Any = None,
 ) -> tuple[list[float], list[list[float]] | None]:
     collate = partial(_collate_fn, pad_token_id=tokenizer.pad_token_id)
     dataset.set_format("python")
@@ -242,22 +273,39 @@ def run_inference(
             outputs = model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
-                output_hidden_states=with_embeddings,
+                output_hidden_states=with_embeddings or linear_head is not None,
             )
 
-            # Confidence should reflect the model's winning label, not a fixed class index.
-            # We use the logit gap between the top two classes and a light Platt-style
-            # calibration to keep outputs from collapsing to ~0 or ~1.
-            confidences = calibrate_confidences(outputs.logits).cpu().tolist()
+            batch_embeddings = None
+            if linear_head is not None:
+                if outputs.hidden_states is None:
+                    raise ValueError(
+                        "Model did not return hidden states required for --checkpoint inference"
+                    )
+                batch_embeddings = extract_last_token_embeddings(
+                    outputs.hidden_states[-1],
+                    attention_mask,
+                )
+                confidences = torch.sigmoid(linear_head(batch_embeddings)).cpu().tolist()
+            else:
+                # Confidence should reflect the model's winning label, not a fixed class index.
+                # We use the logit gap between the top two classes and a light Platt-style
+                # calibration to keep outputs from collapsing to ~0 or ~1.
+                confidences = calibrate_confidences(outputs.logits).cpu().tolist()
             all_confidences.extend(confidences)
 
-            # Embeddings: last hidden state at last non-pad token
-            if with_embeddings and outputs.hidden_states is not None:
-                hidden = outputs.hidden_states[-1]  # [B, seq, dim]
-                for i in range(hidden.size(0)):
-                    last_pos = attention_mask[i].sum().item() - 1
-                    emb = hidden[i, last_pos, :].float().cpu().tolist()
-                    all_embeddings.append(emb)
+            if with_embeddings:
+                if outputs.hidden_states is None:
+                    raise ValueError(
+                        "Model did not return hidden states required for --with-embeddings"
+                    )
+                if batch_embeddings is None:
+                    batch_embeddings = extract_last_token_embeddings(
+                        outputs.hidden_states[-1],
+                        attention_mask,
+                    )
+                for embedding in batch_embeddings.float().cpu().tolist():
+                    all_embeddings.append(embedding)
 
             print(f"  Batch {batch_idx + 1}/{total_batches} done", flush=True)
 
@@ -283,6 +331,8 @@ def _launch_distributed(args: argparse.Namespace) -> None:
     ]
     if args.with_embeddings:
         cmd.append("--with-embeddings")
+    if args.checkpoint:
+        cmd.extend(["--checkpoint", args.checkpoint])
 
     result = subprocess.run(cmd)
     sys.exit(result.returncode)
@@ -299,6 +349,13 @@ def _run_distributed(args: argparse.Namespace) -> None:
 
     print(f"[rank {rank}/{world_size}] Loading model on GPU {rank}")
     model, tokenizer = load_model_and_tokenizer(args.model, "cuda", device_index=rank)
+    linear_head = None
+    if args.checkpoint:
+        linear_head, payload = build_linear_head_from_checkpoint(args.checkpoint, device=f"cuda:{rank}")
+        print(
+            f"[rank {rank}] Loaded tuned head from {args.checkpoint} "
+            f"(base_model={payload['base_model']})"
+        )
 
     dataset = load_input_dataset(args.input)
     if "messages" not in dataset.column_names:
@@ -317,7 +374,7 @@ def _run_distributed(args: argparse.Namespace) -> None:
         print(f"[rank {rank}] Processing {len(shard)} samples")
         tokenized = tokenize_messages(shard, tokenizer, args.max_length)
         confidences, embeddings = run_inference(
-            model, tokenizer, tokenized, args.batch_size, args.with_embeddings
+            model, tokenizer, tokenized, args.batch_size, args.with_embeddings, linear_head
         )
 
     # Gather results from all processes
@@ -369,6 +426,13 @@ def main(argv: list[str] | None = None) -> None:
     print(f"Loading model: {args.model}")
     model, tokenizer = load_model_and_tokenizer(args.model, device)
     print(f"  Model loaded on {device}")
+    linear_head = None
+    if args.checkpoint:
+        linear_head, payload = build_linear_head_from_checkpoint(args.checkpoint, device=device)
+        print(
+            f"  Loaded tuned head from {args.checkpoint} "
+            f"(base_model={payload['base_model']})"
+        )
 
     print(f"Loading dataset: {args.input}")
     dataset = load_input_dataset(args.input)
@@ -383,7 +447,7 @@ def main(argv: list[str] | None = None) -> None:
 
     print("Running inference...")
     confidences, embeddings = run_inference(
-        model, tokenizer, tokenized, args.batch_size, args.with_embeddings
+        model, tokenizer, tokenized, args.batch_size, args.with_embeddings, linear_head
     )
 
     dataset = dataset.add_column("confidence", confidences)
