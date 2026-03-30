@@ -13,6 +13,8 @@ import yaml
 from datasets import Dataset
 from torch.utils.data import DataLoader, TensorDataset
 
+from sklearn.metrics import roc_auc_score
+
 from probes2.finetuning.linear_head import LinearProbeHead, save_linear_head_checkpoint
 from probes2.inference.predict import load_input_dataset
 
@@ -25,6 +27,7 @@ TRAINING_DEFAULTS = {
     "batch_size": 256,
     "weight_decay": 0.0,
     "seed": 0,
+    "train_pct": 1.0,
 }
 
 
@@ -36,6 +39,7 @@ class StageConfig:
     batch_size: int
     weight_decay: float
     seed: int
+    train_pct: float
 
 
 @dataclass
@@ -49,7 +53,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         description="Fine-tune a probe linear head from reflected embeddings"
     )
     parser.add_argument("--model", required=True, help="Base probe model ID or path")
-    parser.add_argument("--dataset", required=True, help="Path to reflected dataset")
+    parser.add_argument(
+        "--dataset",
+        default=None,
+        help="Path to reflected dataset (overrides config YAML 'dataset' key)",
+    )
     parser.add_argument(
         "--checkpoint",
         required=True,
@@ -57,8 +65,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--config",
-        default=None,
-        help="Optional tune config YAML. Defaults to probes2/finetuning/default_tune.yaml",
+        required=True,
+        help="Path to tune config YAML",
     )
     parser.add_argument(
         "--device",
@@ -90,13 +98,16 @@ def resolve_device(device_arg: str | None) -> str:
     return "cpu"
 
 
-def load_tune_config(config_path: str | None) -> dict[str, Any]:
-    path = Path(config_path) if config_path is not None else default_tune_config_path()
+def load_tune_config(config_path: str) -> dict[str, Any]:
+    path = Path(config_path)
     with path.open() as f:
         config = yaml.safe_load(f) or {}
     if not isinstance(config, dict):
         raise ValueError(f"Tune config at {path} must be a YAML mapping")
     return config
+
+
+NON_TRAINING_KEYS = ("dataset",)
 
 
 def split_config(config: dict[str, Any]) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
@@ -112,7 +123,7 @@ def split_config(config: dict[str, Any]) -> tuple[dict[str, Any], dict[str, dict
                 stage_overrides[key] = dict(value)
             else:
                 raise ValueError(f"Stage override '{key}' must be a mapping")
-        else:
+        elif key not in NON_TRAINING_KEYS:
             global_defaults[key] = value
     return global_defaults, stage_overrides
 
@@ -143,6 +154,7 @@ def resolve_stage_config(config: dict[str, Any], stage_name: str) -> StageConfig
     batch_size = _as_int(merged["batch_size"], f"{stage_name}.batch_size")
     weight_decay = _as_float(merged["weight_decay"], f"{stage_name}.weight_decay")
     seed = _as_int(merged["seed"], f"{stage_name}.seed")
+    train_pct = _as_float(merged["train_pct"], f"{stage_name}.train_pct")
 
     if lr <= 0:
         raise ValueError(f"{stage_name}.lr must be > 0, got {lr}")
@@ -156,6 +168,10 @@ def resolve_stage_config(config: dict[str, Any], stage_name: str) -> StageConfig
         raise ValueError(
             f"{stage_name}.weight_decay must be >= 0, got {weight_decay}"
         )
+    if not 0.0 < train_pct <= 1.0:
+        raise ValueError(
+            f"{stage_name}.train_pct must be in (0, 1], got {train_pct}"
+        )
 
     return StageConfig(
         lr=lr,
@@ -164,6 +180,7 @@ def resolve_stage_config(config: dict[str, Any], stage_name: str) -> StageConfig
         batch_size=batch_size,
         weight_decay=weight_decay,
         seed=seed,
+        train_pct=train_pct,
     )
 
 
@@ -339,12 +356,43 @@ def build_stage_rows(dataset: Dataset) -> tuple[dict[str, StageRows], int]:
     return rows_by_stage, input_dim
 
 
+def _split_train_eval(
+    stage_rows: StageRows,
+    train_pct: float,
+    seed: int,
+) -> tuple[StageRows, StageRows | None]:
+    if train_pct >= 1.0:
+        return stage_rows, None
+
+    n = len(stage_rows.targets)
+    indices = list(range(n))
+    rng = random.Random(seed)
+    rng.shuffle(indices)
+    split = max(1, int(n * train_pct))
+
+    train_idx = indices[:split]
+    eval_idx = indices[split:]
+    if not eval_idx:
+        return stage_rows, None
+
+    train_rows = StageRows(
+        embeddings=[stage_rows.embeddings[i] for i in train_idx],
+        targets=[stage_rows.targets[i] for i in train_idx],
+    )
+    eval_rows = StageRows(
+        embeddings=[stage_rows.embeddings[i] for i in eval_idx],
+        targets=[stage_rows.targets[i] for i in eval_idx],
+    )
+    return train_rows, eval_rows
+
+
 def train_stage(
     head: LinearProbeHead,
     stage_name: str,
     stage_rows: StageRows,
     stage_config: StageConfig,
     device: str,
+    eval_rows: StageRows | None = None,
 ) -> None:
     if not stage_rows.targets:
         return
@@ -360,6 +408,13 @@ def train_stage(
         shuffle=True,
         generator=generator,
     )
+
+    if eval_rows is not None and eval_rows.targets:
+        eval_features = torch.tensor(eval_rows.embeddings, dtype=torch.float32).to(device)
+        eval_targets = torch.tensor(eval_rows.targets, dtype=torch.float32).to(device)
+    else:
+        eval_features = None
+        eval_targets = None
 
     optimizer = torch.optim.AdamW(
         head.linear.parameters(),
@@ -384,9 +439,34 @@ def train_stage(
             total_loss += loss.item() * batch_targets.size(0)
 
         average_loss = total_loss / len(tensor_dataset)
+        eval_msg = ""
+        if eval_features is not None:
+            head.eval()
+            with torch.no_grad():
+                eval_logits = head(eval_features)
+                eval_loss = loss_fn(eval_logits, eval_targets).item()
+                eval_probs = torch.sigmoid(eval_logits).cpu().numpy()
+                eval_labels = eval_targets.cpu().numpy()
+            head.train()
+            head.dropout.p = stage_config.dropout
+            eval_msg = f" eval_loss={eval_loss:.6f}"
+            if len(set(eval_labels)) >= 2:
+                auroc = roc_auc_score(eval_labels, eval_probs)
+                eval_msg += f" eval_auroc={auroc:.4f}"
         print(
-            f"[{stage_name}] epoch {epoch + 1}/{stage_config.epochs} loss={average_loss:.6f}"
+            f"[{stage_name}] epoch {epoch + 1}/{stage_config.epochs} loss={average_loss:.6f}{eval_msg}"
         )
+
+
+def resolve_dataset_path(args: argparse.Namespace, config: dict[str, Any]) -> str:
+    if args.dataset is not None:
+        return args.dataset
+    dataset_path = config.get("dataset")
+    if dataset_path is None:
+        raise ValueError(
+            "No dataset specified. Provide --dataset or set 'dataset' in the config YAML."
+        )
+    return str(dataset_path)
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -394,6 +474,7 @@ def main(argv: list[str] | None = None) -> None:
     validate_args(args)
     config = load_tune_config(args.config)
     device = resolve_device(args.device)
+    dataset_path = resolve_dataset_path(args, config)
 
     seed = resolve_global_seed(config)
     random.seed(seed)
@@ -401,9 +482,9 @@ def main(argv: list[str] | None = None) -> None:
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
-    config_path = Path(args.config) if args.config is not None else default_tune_config_path()
-    print(f"Loading dataset: {args.dataset}")
-    dataset = load_input_dataset(args.dataset)
+    config_path = Path(args.config)
+    print(f"Loading dataset: {dataset_path}")
+    dataset = load_input_dataset(dataset_path)
     stage_rows, input_dim = build_stage_rows(dataset)
     print(f"  {len(dataset)} rows loaded")
     print(f"Using config: {config_path}")
@@ -419,12 +500,21 @@ def main(argv: list[str] | None = None) -> None:
             continue
 
         stage_config = resolve_stage_config(config, stage_name)
+        train_rows, eval_rows = _split_train_eval(
+            current_rows, stage_config.train_pct, stage_config.seed
+        )
+
+        eval_info = ""
+        if eval_rows is not None:
+            eval_info = f" eval={len(eval_rows.targets)}"
         print(
-            f"Training {stage_name}: rows={len(current_rows.targets)} "
+            f"Training {stage_name}: train={len(train_rows.targets)}{eval_info} "
             f"lr={stage_config.lr} dropout={stage_config.dropout} "
             f"epochs={stage_config.epochs}"
         )
-        train_stage(head, stage_name, current_rows, stage_config, device)
+
+        use_eval = eval_rows if stage_name == "annotated" else None
+        train_stage(head, stage_name, train_rows, stage_config, device, eval_rows=use_eval)
 
     head.dropout.p = 0.0
     head.eval()

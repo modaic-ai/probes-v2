@@ -169,7 +169,8 @@ def tokenize_messages(
     max_length: int,
 ) -> Dataset:
     def _tokenize_row(row: dict) -> dict:
-        parsed = json.loads(row["messages"])
+        raw = row["messages"]
+        parsed = json.loads(raw) if isinstance(raw, (str, bytes, bytearray)) else raw
         messages = parsed["messages"]
         text = tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=False

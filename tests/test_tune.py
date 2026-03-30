@@ -16,10 +16,10 @@ from probes2.finetuning.tune import (
 )
 
 
-def test_default_tune_config_is_used_when_config_is_omitted() -> None:
-    config = load_tune_config(None)
-
-    assert default_tune_config_path().exists()
+def test_default_tune_config_loads_correctly() -> None:
+    path = default_tune_config_path()
+    assert path.exists()
+    config = load_tune_config(str(path))
 
     self_consistency = resolve_stage_config(config, "self_consistency")
     cross_consistency = resolve_stage_config(config, "cross_consistency")
@@ -27,12 +27,15 @@ def test_default_tune_config_is_used_when_config_is_omitted() -> None:
 
     assert self_consistency.lr == pytest.approx(1e-5)
     assert self_consistency.dropout == pytest.approx(0.1)
+    assert self_consistency.train_pct == pytest.approx(1.0)
 
     assert cross_consistency.lr == pytest.approx(1e-4)
     assert cross_consistency.dropout == pytest.approx(0.0)
+    assert cross_consistency.train_pct == pytest.approx(1.0)
 
     assert annotated.lr == pytest.approx(1e-3)
     assert annotated.dropout == pytest.approx(0.0)
+    assert annotated.train_pct == pytest.approx(0.8)
 
 
 def test_stage_config_overrides_global_defaults() -> None:
@@ -114,6 +117,7 @@ def test_tune_main_writes_linear_head_checkpoint(
     )
     dataset_path = tmp_path / "reflected.parquet"
     checkpoint_path = tmp_path / "head.pt"
+    config_path = str(default_tune_config_path())
     monkeypatch.setattr(tune_module, "load_input_dataset", lambda _: dataset)
 
     main(
@@ -122,6 +126,8 @@ def test_tune_main_writes_linear_head_checkpoint(
             "modaic/test-probe",
             "--dataset",
             str(dataset_path),
+            "--config",
+            config_path,
             "--checkpoint",
             str(checkpoint_path),
             "--device",

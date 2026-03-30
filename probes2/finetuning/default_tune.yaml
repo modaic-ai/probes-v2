@@ -1,3 +1,5 @@
+dataset: null
+
 self_consistency:
   lr: 1e-5
   dropout: 0.1
@@ -5,6 +7,7 @@ cross_consistency:
   lr: 1e-4
 annotated:
   lr: 1e-3
+  train_pct: 0.8
 
 lr: 1e-5
 dropout: 0.0

@@ -37,7 +37,7 @@ def _get_env_float(name: str) -> float | None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run LLM inference on a dataset using a YAML-defined arbiter")
-    parser.add_argument("-a", "--arbiter", required=True, help="Path to arbiter YAML spec")
+    parser.add_argument("-a", "--arbiter", required=True, help="Path to arbiter YAML spec or precompiled path on Modaic Hub")
     parser.add_argument("-i", "--input", required=True, help="Path to input dataset (.jsonl, .parquet, .arrow)")
     parser.add_argument("-o", "--output", required=True, help="Path to output dataset")
     parser.add_argument(
@@ -150,15 +150,28 @@ def save_output_dataset(dataset: Dataset, path: str) -> None:
     logger.info("Dataset saved to %s", path)
 
 
-def build_arbiter(yaml_path: str) -> tuple[Predict, PredictYamlSpec]:
-    with open(yaml_path) as f:
-        spec = PredictYamlSpec(**yaml.safe_load(f))
+def build_arbiter(arbiter_path: str) -> tuple[Predict, PredictYamlSpec | None]:
+    """Build an arbiter from a YAML spec or a precompiled path on Modaic Hub.
 
-    arbiter = Predict.from_yaml(yaml_path).as_arbiter()
+    Returns (arbiter, spec) where spec is None when loaded from precompiled.
+    """
+    if arbiter_path.endswith((".yaml", ".yml")):
+        with open(arbiter_path) as f:
+            spec = PredictYamlSpec(**yaml.safe_load(f))
+        arbiter = Predict.from_yaml(arbiter_path).as_arbiter()
+    else:
+        spec = None
+        arbiter = Predict.from_precompiled(arbiter_path).as_arbiter()
 
     safe_lm = SafeLM.from_lm(arbiter.lm)
     arbiter.lm = safe_lm
     dspy.configure(lm=safe_lm)
+
+    # TEMPORARY: log the DSPy signature for debugging
+    logger.info("DSPy signature: %s", arbiter.signature)
+    logger.info("DSPy signature output fields: %s", {
+        k: (v.annotation, v.json_schema_extra) for k, v in arbiter.signature.output_fields.items()
+    })
 
     return arbiter, spec
 
@@ -235,7 +248,15 @@ def _append_prediction(
 ) -> None:
     prediction_error = getattr(prediction, "error", None) if _is_failed_prediction(prediction) else None
     for field in output_fields:
-        new_columns[field].append(getattr(prediction, field, None))
+        value = getattr(prediction, field, None)
+        # TEMPORARY: log type mismatches for debugging
+        if value is None:
+            logger.debug("TEMP_DEBUG: field=%s value=None (null appended)", field)
+        elif isinstance(value, str) and not isinstance(value, list):
+            logger.warning("TEMP_DEBUG: field=%s type=%s value=%r (expected list?)", field, type(value).__name__, value[:200] if len(value) > 200 else value)
+        elif not isinstance(value, list):
+            logger.warning("TEMP_DEBUG: field=%s type=%s value=%r (not a list)", field, type(value).__name__, value)
+        new_columns[field].append(value)
 
     prediction_obj = {field: getattr(prediction, field, None) for field in output_fields}
     if prediction_error is not None:
@@ -257,10 +278,10 @@ def _compute_consistency_confidence(
 ) -> list[float]:
     confidences = []
     for orig, samples in zip(original_predictions, sc_predictions):
-        orig_values = tuple(str(getattr(orig, f, "")).strip() for f in output_fields)
+        orig_values = tuple(getattr(orig, f, None) for f in output_fields)
         matches = sum(
             1 for s in samples
-            if tuple(str(getattr(s, f, "")).strip() for f in output_fields) == orig_values
+            if tuple(getattr(s, f, None) for f in output_fields) == orig_values
         )
         confidences.append(matches / len(samples))
     return confidences
@@ -580,8 +601,12 @@ def main():
     if args.council:
         council_arbiters = build_council_arbiters(arbiter, args.council)
 
-    input_fields = [f.name for f in spec.inputs]
-    output_fields = [f.name for f in spec.outputs]
+    if spec is not None:
+        input_fields = [f.name for f in spec.inputs]
+        output_fields = [f.name for f in spec.outputs]
+    else:
+        input_fields = list(arbiter.signature.input_fields.keys())
+        output_fields = list(arbiter.signature.output_fields.keys())
     logger.info("Input fields: %s", input_fields)
     logger.info("Output fields: %s", output_fields)
 

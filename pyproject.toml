@@ -5,13 +5,15 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "modaic>=0.25.2",
+    "modaic>=0.28.0",
     "datasets",
     "duckdb",
     "transformers>=5",
     "peft",
     "accelerate",
     "modal>=1.3.5",
+    "gradio>=6.10.0",
+    "scikit-learn",
 ]
 
 [project.optional-dependencies]
@@ -23,6 +25,8 @@ cu128 = ["torch", "torchvision"]
 predict = "probes2.inference.predict:main"
 reflect = "probes2.inference.reflect:main"
 tune = "probes2.finetuning.tune:main"
+eval = "probes2.eval:main"
+view = "probes2.view:app"
 
 [build-system]
 requires = ["hatchling"]
